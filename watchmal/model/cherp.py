@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.utils import softmax
-from node_encoder import NodeEncoder
+from .node_encoder import NodeEncoder
 '''
 CheRP: Cherenkov Ring Perceiver
 A refinement of CLSGAT with a Perceiver/Set Transformer-style token bottleneck; the sparse/dense attention
