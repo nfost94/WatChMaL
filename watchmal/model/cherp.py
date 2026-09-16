@@ -3,27 +3,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.utils import softmax
+from node_encoder import NodeEncoder
 '''
 CheRP: Cherenkov Ring Perceiver
-A refinement of CLSGAT with a Perceiver-style token bottleneck; the sparse attention
-core is torch-compiled to process many thousands of PMTs per event.
+A refinement of CLSGAT with a Perceiver/Set Transformer-style token bottleneck; the sparse/dense attention
+core is torch-compiled (optional) to process many thousands of PMTs per event.
 '''
-
-class NodeEncoder(nn.Module):
-    def __init__(self, in_channels, hidden_channels, dropout=0.0):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels, hidden_channels),
-            nn.GELU(),
-            nn.Dropout(p=dropout),
-            nn.LayerNorm(hidden_channels),
-            nn.Linear(hidden_channels, hidden_channels),
-        )
-
-    def forward(self, x):
-        return self.mlp(x)
-
-
+##Latent Transformer Block (t2t) for the latent tokens; can be shared across all layers or not
 class TokenTransformerBlock(nn.Module):
     def __init__(self, hidden_channels, num_heads, dropout=0.0, pre_norm=False):
         super().__init__()
@@ -76,8 +62,7 @@ class DenseTokenLayerCore(nn.Module):
 
         weighted_v = V_n * attn_weights.unsqueeze(-1)
         weighted_v = weighted_v.reshape(weighted_v.size(0), weighted_v.size(1), -1)
-        agg = weighted_v.float().sum(dim=1)
-        agg = agg.to(query_x.dtype)
+        agg = weighted_v.sum(dim=1)
 
         received = agg.abs().sum(dim=-1, keepdim=True) > 0
 
@@ -96,9 +81,9 @@ class DenseTokenLayerCore(nn.Module):
             out = torch.where(received, normed, query_x)
         return out
 
-
+## For dense latent token -> node attention (fixed tokens per node)
 class DenseTokenAttentionLayer(nn.Module):
-    def __init__(self, hidden_channels, num_heads=4, dropout=0.0, pre_norm=False):
+    def __init__(self, hidden_channels, num_heads=4, dropout=0.0, pre_norm=False, use_compile=True):
         super().__init__()
         assert hidden_channels % num_heads == 0
         self.hidden    = hidden_channels
@@ -107,9 +92,8 @@ class DenseTokenAttentionLayer(nn.Module):
         self.scale     = math.sqrt(self.head_dim)
         self.dropout   = dropout
         self.pre_norm  = pre_norm
-        self.core      = torch.compile(
-            DenseTokenLayerCore(hidden_channels, num_heads, self.scale, dropout, pre_norm)
-        )
+        core = DenseTokenLayerCore(hidden_channels, num_heads, self.scale, dropout, pre_norm)
+        self.core = torch.compile(core) if use_compile else core
         self.q_proj = nn.Linear(hidden_channels, hidden_channels, bias=False)
         self.k_proj = nn.Linear(hidden_channels, hidden_channels, bias=False)
         self.v_proj = nn.Linear(hidden_channels, hidden_channels, bias=False)
@@ -148,7 +132,6 @@ class DenseTokenAttentionLayer(nn.Module):
 
         return out
 
-
 class CompiledLayerCore(nn.Module):
     def __init__(self, hidden_channels, num_heads, scale, dropout, use_cosine=False, pre_norm=False):
         super().__init__()
@@ -178,9 +161,8 @@ class CompiledLayerCore(nn.Module):
         weighted_v = v_col * attn_weights.unsqueeze(-1)
 
         agg = torch.zeros((num_query, self.num_heads * self.head_dim),
-                          device=query_x.device, dtype=torch.float32)
-        agg.index_add_(0, row, weighted_v.view(-1, self.num_heads * self.head_dim).float())
-        agg = agg.to(query_x.dtype)
+                          device=query_x.device, dtype=query_x.dtype)
+        agg.index_add_(0, row, weighted_v.view(-1, self.num_heads * self.head_dim))
 
         received = agg.abs().sum(dim=-1, keepdim=True) > 0
 
@@ -198,9 +180,9 @@ class CompiledLayerCore(nn.Module):
             normed = F.layer_norm(query_x + x_out, (query_x.size(-1),), norm_weight, norm_bias)
             out = torch.where(received, normed, query_x)
         return out
-
+##For sparse node -> token attention (variable nodes per token)
 class AttentionLayer(nn.Module):
-    def __init__(self, hidden_channels, num_heads=4, dropout=0.0, use_cosine=False, pre_norm=False):
+    def __init__(self, hidden_channels, num_heads=4, dropout=0.0, use_cosine=False, pre_norm=False, use_compile=True):
         super().__init__()
         assert hidden_channels % num_heads == 0
         self.hidden   = hidden_channels
@@ -210,9 +192,8 @@ class AttentionLayer(nn.Module):
         self.dropout   = dropout
         self.use_cosine = use_cosine
         self.pre_norm  = pre_norm
-        self.core      = torch.compile(
-            CompiledLayerCore(hidden_channels, num_heads, self.scale, dropout, use_cosine, pre_norm)
-        )
+        core = CompiledLayerCore(hidden_channels, num_heads, self.scale, dropout, use_cosine, pre_norm)
+        self.core = torch.compile(core) if use_compile else core
         self.q_proj = nn.Linear(hidden_channels, hidden_channels, bias=False)
         self.k_proj = nn.Linear(hidden_channels, hidden_channels, bias=False)
         self.v_proj = nn.Linear(hidden_channels, hidden_channels, bias=False)
@@ -256,7 +237,7 @@ class CheRP(nn.Module):
         self,
         in_channels,
         hidden_channels,
-        out_dim,
+        out_channels,
         num_layers=4,
         num_heads=4,
         num_tokens=6,
@@ -264,11 +245,12 @@ class CheRP(nn.Module):
         token_layers_per_step=1,
         use_nhits=False,
         use_event_total_charge=False,
-        dropout=0.0,
-        node_dropout=0.0,
-        cosine_attention=False,
-        pre_norm=False,
-        shared_token_transformer=True,
+        dropout=0.0, ##dropout on attention and MLP layers
+        node_dropout=0.0, ##drop out on node features before token attention; regularization and robustness
+        cosine_attention=False, ##Optional alternative to dot-product attention handles energy/momentum regression better without scale (nhits/totq) hint
+        pre_norm=False, ##For shallow networks, pre_norm is not needed and can underfit; for deeper networks, pre_norm is recommended to avoid gradient issues/stability
+        shared_token_transformer=True, ##T2T latent trasnformer is shared across all layers (weight-tied) or not (one per layer)
+        use_compile=True, ##torch.compile reduces VRAM usage and should retain speed, (feedback welcome)
     ):
         super().__init__()
 
@@ -293,29 +275,31 @@ class CheRP(nn.Module):
 
         token_init = torch.empty(num_tokens, hidden_channels)
         nn.init.orthogonal_(token_init)
-        self.register_buffer('token_embed', token_init)   # frozen: fixed orthogonal basis, never trained
+        self.token_embed = nn.Parameter(token_init)   # learned, orthogonally initialised
 
         self.cls_token = nn.Parameter(torch.zeros(1, hidden_channels))
         nn.init.normal_(self.cls_token, std=0.02)
-
+        ## initialise cls token with scale features (nhits, total_charge) if enabled; else zero vector
         if self.use_global_token:
             global_dim = int(use_nhits) + int(use_event_total_charge)
-            self.global_token_proj = nn.Linear(global_dim, hidden_channels)
+            self.global_token_proj = nn.Linear(global_dim, hidden_channels) ##single learned projection
 
-        self.encoder = NodeEncoder(in_channels, hidden_channels)
-
+        self.encoder = NodeEncoder(in_channels, hidden_channels, use_gelu=True)  # node encoder for PMT features
+        ## Final regression/classifcation head
         self.head = nn.Sequential(
                 nn.LayerNorm(hidden_channels),
                 nn.Linear(hidden_channels, hidden_channels),
                 nn.ReLU(),
-                nn.Linear(hidden_channels, out_dim, bias=True))       
-
+                nn.Linear(hidden_channels, out_channels, bias=True))       
+        ##Sparse node to token operation
         self.n2t_layers = nn.ModuleList([
-            AttentionLayer(hidden_channels, num_heads, dropout, use_cosine=cosine_attention, pre_norm=pre_norm)
+            AttentionLayer(hidden_channels, num_heads, dropout, use_cosine=cosine_attention, pre_norm=pre_norm,
+                            use_compile=use_compile)
             for _ in range(num_layers)
         ])
+        ##Dense token to node operation
         self.t2n_layers = nn.ModuleList([
-            DenseTokenAttentionLayer(hidden_channels, num_heads, dropout, pre_norm=pre_norm)
+            DenseTokenAttentionLayer(hidden_channels, num_heads, dropout, pre_norm=pre_norm, use_compile=use_compile)
             for _ in range(num_layers - 1)
         ])
 
@@ -328,12 +312,12 @@ class CheRP(nn.Module):
                 TokenTransformerBlock(hidden_channels, num_heads, dropout, pre_norm=pre_norm)
                 for _ in range(total_token_layers)
             ])
-
+        ## Final transformer layers for refinement of the CLS readout
         self.transformerend_layers = nn.ModuleList([
             TokenTransformerBlock(hidden_channels, num_heads, dropout, pre_norm=pre_norm)
             for _ in range(num_end_layers)
         ])
-
+    ##combine tokens (CLS + latent) with optional global features (nhits, tot_charge) for input to the token transformer
     def get_tokens(self, data, batch, batch_size):
         base_toks = self.token_embed.unsqueeze(0).expand(batch_size, -1, -1)
 
@@ -355,30 +339,32 @@ class CheRP(nn.Module):
         x, batch   = data.x, data.batch
         num_nodes  = x.size(0)
         batch_size = data.num_graphs
-
+        ## Encode nodes from data inputs
         nodes = self.encoder(x)
-
+        ##Optional dropout on nodes (for regularization and robustness)
         if self.training and self.node_dropout > 0.0:
             mask = torch.bernoulli(
                 torch.full((num_nodes, 1), 1.0 - self.node_dropout, device=nodes.device)
             )
             nodes = nodes * mask
-
+        #Get latent tokens (cls + latent tokens)
         tokens = self.get_tokens(data, batch, batch_size)
-
+        ##node positions in batch for sparse attention (n2t) -- query=token, kv=node
         node_local  = torch.arange(num_nodes, device=nodes.device).repeat_interleave(self.num_tokens)
+        ##token positions in batch for sparse attention (n2t) -- query=token, kv=node
         token_local = (
             batch.unsqueeze(1) * self.total_tokens
             + torch.arange(self.num_special_tokens, self.total_tokens, device=nodes.device)
         ).reshape(-1)
-
+        ##build node -> token edge index for sparse attention (n2t) -- query=token, kv=node 
         edge_index_node_token  = torch.stack([token_local, node_local], dim=0)   # query=token, kv=node
-
-        token_layer_idx = 0
+        token_layer_idx = 0 ##Handles the case where each layer has multiple token transformer invocations (weight-tied or not)
         for i in range(self.num_layers):
+            ##n2t pass: each token attends to all nodes in its event (sparse attention) (cls token excluded)
             tokens = self.n2t_layers[i](tokens, nodes, edge_index_node_token)
-
+            ##Grab the tokens
             tokens_seq = tokens.view(batch_size, self.total_tokens, -1)
+            ##Handle t2t passes (weight-tied or not) -- CLS token is included in the t2t passes 
             for _ in range(self.token_layers_per_step[i]):
                 if self.shared_token_transformer:
                     tokens_seq = self.token_transformer(tokens_seq)
@@ -386,10 +372,10 @@ class CheRP(nn.Module):
                     tokens_seq = self.token_transformers[token_layer_idx](tokens_seq)
                     token_layer_idx += 1
             tokens = tokens_seq.reshape(-1, self.hidden_channels)
-
-            if i < self.num_layers - 1:
+            
+            if i < self.num_layers - 1: ##skip t2n on the last layer, since the CLS token is used for the final readout
                 # dense gather: every node attends all of its event's tokens (CLS excluded)
-                node_kv_toks = tokens_seq[:, self.num_special_tokens:, :]
+                node_kv_toks = tokens_seq[:, self.num_special_tokens:, :] ##exlcudes the cls token
                 nodes = self.t2n_layers[i](nodes, node_kv_toks, batch)
 
         token_out = tokens.view(batch_size, self.total_tokens, -1)
@@ -398,7 +384,7 @@ class CheRP(nn.Module):
             token_out = layer(token_out)
 
         cls_out = token_out[:, 0, :]   # CLS token at slot 0
-
+        ##MLP head for regression/classification on CLS token
         output = self.head(cls_out)
        
         return output
